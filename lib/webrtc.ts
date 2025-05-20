@@ -16,7 +16,12 @@ export async function initializeWebRTC(mediaStatus: MediaStatus) {
   }
 }
 
-export async function setupPeerConnection(localStream: MediaStream, onRemoteStream: (stream: MediaStream) => void) {
+export async function setupPeerConnection(
+  localStream: MediaStream,
+  onRemoteStream: (stream: MediaStream) => void,
+  onSignal: (data: any) => void,
+  onReceiveSignal: (cb: (data: any) => void) => void
+) {
   // Create RTCPeerConnection with STUN/TURN servers for NAT traversal
   const configuration = {
     iceServers: [
@@ -41,10 +46,27 @@ export async function setupPeerConnection(localStream: MediaStream, onRemoteStre
   // ICE candidate handling
   peerConnection.onicecandidate = (event) => {
     if (event.candidate) {
-      // In a real app, send this to the signaling server
-      console.log("New ICE candidate:", event.candidate)
+      onSignal({ type: "candidate", candidate: event.candidate })
     }
   }
+
+  // Terima signaling data dari server
+  onReceiveSignal(async (data) => {
+    if (data.type === "offer") {
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer))
+      const answer = await peerConnection.createAnswer()
+      await peerConnection.setLocalDescription(answer)
+      onSignal({ type: "answer", answer })
+    } else if (data.type === "answer") {
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer))
+    } else if (data.type === "candidate" && data.candidate) {
+      try {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate))
+      } catch (e) {
+        console.error("Error adding received ICE candidate", e)
+      }
+    }
+  })
 
   // Connection state monitoring
   peerConnection.onconnectionstatechange = () => {

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useState, useRef } from "react"
 import { useParams, useRouter } from "next/navigation"
 import { useMediaDevices } from "@/hooks/use-media-devices"
 import { useChat } from "@/hooks/use-chat"
@@ -12,6 +12,7 @@ import { formatTime } from "@/lib/utils"
 import { Copy, CheckCircle } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { toast } from "@/hooks/use-toast"
+import { setupPeerConnection } from "@/lib/webrtc"
 
 export default function MeetingRoom() {
   const params = useParams()
@@ -21,13 +22,16 @@ export default function MeetingRoom() {
   const [isClient, setIsClient] = useState(false)
   const [elapsedTime, setElapsedTime] = useState(0)
   const [participants, setParticipants] = useState<User[]>([{ id: "self", name: "You", email: "", initials: "YO" }])
-  const [remoteStreams] = useState<Map<string, MediaStream>>(new Map())
+  const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map())
+  const [peerConnections, setPeerConnections] = useState<Map<string, RTCPeerConnection>>(new Map())
   const [linkCopied, setLinkCopied] = useState(false)
   const [showEndModal, setShowEndModal] = useState(false)
 
   const { stream, mediaStatus, toggleAudio, toggleVideo, startScreenShare, stopScreenShare, error } = useMediaDevices()
 
   const { messages, newMessage, setNewMessage, sendMessage, isChatOpen, toggleChat, unreadCount } = useChat(meetingId)
+
+  const wsRef = useRef<WebSocket | null>(null)
 
   // Initialize timer
   useEffect(() => {
@@ -63,6 +67,117 @@ export default function MeetingRoom() {
       }
     }
   }, [])
+
+  // --- SIGNALING LOGIC START ---
+  useEffect(() => {
+    if (!stream) return
+    // Ganti URL berikut dengan signaling server Anda
+    const ws = new WebSocket("wss://your-signaling-server?room=" + meetingId)
+    wsRef.current = ws
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: "join", username }))
+    }
+
+    ws.onmessage = async (event) => {
+      const data = JSON.parse(event.data)
+      // Handle user join
+      if (data.type === "joined" && data.id !== wsRef.current?.url) {
+        const peerId = data.id
+        if (peerConnections.has(peerId)) return
+        const pc = await setupPeerConnection(
+          stream,
+          (remoteStream) => {
+            setRemoteStreams((prev) => {
+              const map = new Map(prev)
+              map.set(peerId, remoteStream)
+              return map
+            })
+          },
+          (signal) => ws.send(JSON.stringify({ ...signal, to: peerId, from: wsRef.current?.url })),
+          (cb) => {
+            ws.addEventListener("message", (e) => {
+              const msg = JSON.parse(e.data)
+              if (msg.from === peerId) cb(msg)
+            })
+          }
+        )
+        setPeerConnections((prev) => {
+          const map = new Map(prev)
+          map.set(peerId, pc)
+          return map
+        })
+        // Kirim offer
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        ws.send(JSON.stringify({ type: "offer", offer, to: peerId, from: wsRef.current?.url }))
+      }
+      // Handle offer/answer/candidate
+      if (data.type === "offer" && data.to === wsRef.current?.url) {
+        const peerId = data.from
+        if (peerConnections.has(peerId)) return
+        const pc = await setupPeerConnection(
+          stream,
+          (remoteStream) => {
+            setRemoteStreams((prev) => {
+              const map = new Map(prev)
+              map.set(peerId, remoteStream)
+              return map
+            })
+          },
+          (signal) => ws.send(JSON.stringify({ ...signal, to: peerId, from: wsRef.current?.url })),
+          (cb) => {
+            ws.addEventListener("message", (e) => {
+              const msg = JSON.parse(e.data)
+              if (msg.from === peerId) cb(msg)
+            })
+          }
+        )
+        setPeerConnections((prev) => {
+          const map = new Map(prev)
+          map.set(peerId, pc)
+          return map
+        })
+        await pc.setRemoteDescription(new RTCSessionDescription(data.offer))
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        ws.send(JSON.stringify({ type: "answer", answer, to: peerId, from: wsRef.current?.url }))
+      }
+      if (data.type === "answer" && data.to === wsRef.current?.url) {
+        const peerId = data.from
+        const pc = peerConnections.get(peerId)
+        if (pc) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.answer))
+        }
+      }
+      if (data.type === "candidate" && data.to === wsRef.current?.url) {
+        const peerId = data.from
+        const pc = peerConnections.get(peerId)
+        if (pc && data.candidate) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate))
+          } catch (e) {
+            console.error("Error adding ICE candidate", e)
+          }
+        }
+      }
+    }
+
+    ws.onclose = () => {
+      peerConnections.forEach((pc) => pc.close())
+      setPeerConnections(new Map())
+      setRemoteStreams(new Map())
+    }
+
+    return () => {
+      ws.close()
+      peerConnections.forEach((pc) => pc.close())
+      setPeerConnections(new Map())
+      setRemoteStreams(new Map())
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stream, meetingId, username])
+  // --- SIGNALING LOGIC END ---
 
   const toggleScreenShare = async () => {
     if (mediaStatus.screen) {
